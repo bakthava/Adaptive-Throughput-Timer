@@ -10,6 +10,7 @@ import org.apache.jmeter.threads.JMeterThread;
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.locks.*;
 
 /**
  * Adaptive Timer that reads CSV file with time/TPS targets and adjusts thread count dynamically
@@ -31,6 +32,7 @@ public class AdaptiveTimerFromCSV extends AbstractTestElement implements Timer {
     public static final String DEFAULT_START_TIME = "defaultStartTime";
     public static final String RANGE_MODE = "rangeMode"; // "default", "step", or "time"
     public static final String INFINITE_EXECUTION = "infiniteExecution"; // true/false for 24-hour cycling
+    public static final String ENABLE_CSV_RELOAD = "enableCsvReload"; // true/false for dynamic CSV reload
 
     // Runtime state
     private static volatile List<CSVThroughputEntry> csvEntries;
@@ -40,6 +42,14 @@ public class AdaptiveTimerFromCSV extends AbstractTestElement implements Timer {
     private static volatile int currentThreadTarget = 1;
     private static volatile boolean initialized = false;
     private static final Object INIT_LOCK = new Object();
+    
+    // Dynamic CSV reload state
+    private static volatile String currentCsvFilePath;
+    private static volatile long lastFileModifiedTime = 0;
+    private static volatile ScheduledExecutorService csvReloadExecutor;
+    private static volatile ScheduledFuture<?> csvReloadTask;
+    private static final ReentrantReadWriteLock CSV_LOCK = new ReentrantReadWriteLock();
+    private static volatile boolean reloadEnabled = true;
 
     @Override
     public long delay() {
@@ -71,7 +81,15 @@ public class AdaptiveTimerFromCSV extends AbstractTestElement implements Timer {
             adjustedElapsedTime = elapsedTime % twentyFourHoursMs;
         }
         
-        int targetTps = CSVThroughputReader.getTargetTpsForTime(csvEntries, adjustedElapsedTime);
+        int targetTps = 0;
+        CSV_LOCK.readLock().lock();
+        try {
+            if (csvEntries != null && !csvEntries.isEmpty()) {
+                targetTps = CSVThroughputReader.getTargetTpsForTime(csvEntries, adjustedElapsedTime);
+            }
+        } finally {
+            CSV_LOCK.readLock().unlock();
+        }
 
         if (targetTps <= 0) {
             return 0; // No delay if TPS not specified
@@ -87,7 +105,16 @@ public class AdaptiveTimerFromCSV extends AbstractTestElement implements Timer {
     private void initializeTest() {
         try {
             String filePath = getCsvFilePath();
-            csvEntries = CSVThroughputReader.readFile(filePath);
+            currentCsvFilePath = filePath;
+            reloadEnabled = isEnableCsvReload(); // Initialize from property
+            
+            CSV_LOCK.writeLock().lock();
+            try {
+                csvEntries = CSVThroughputReader.readFile(filePath);
+                lastFileModifiedTime = new java.io.File(filePath).lastModified();
+            } finally {
+                CSV_LOCK.writeLock().unlock();
+            }
             
             if (csvEntries.isEmpty()) {
                 throw new RuntimeException("No valid entries found in file: " + filePath);
@@ -124,8 +151,14 @@ public class AdaptiveTimerFromCSV extends AbstractTestElement implements Timer {
             System.out.println("  Total entries: " + csvEntries.size());
             System.out.println("  Mode: " + rangeMode);
             System.out.println("  Infinite Execution: " + isInfiniteExecution());
+            System.out.println("  CSV Reload Enabled: " + reloadEnabled);
             System.out.println("  Starting threads (min): " + currentThreadTarget);
             System.out.println("  Entries: " + csvEntries);
+            
+            // Start the CSV reload task if enabled
+            if (reloadEnabled) {
+                startCsvReloadTask();
+            }
 
             initialized = true;
         } catch (IOException e) {
@@ -173,55 +206,64 @@ public class AdaptiveTimerFromCSV extends AbstractTestElement implements Timer {
      * Adjust thread count based on current vs target TPS
      */
     private void adjustThreadCount() {
-        if (csvEntries == null || csvEntries.isEmpty() || metrics == null) {
+        if (metrics == null) {
             return;
         }
 
-        long elapsedTime = System.currentTimeMillis() - testStartTime;
-        int targetTps = CSVThroughputReader.getTargetTpsForTime(csvEntries, elapsedTime);
-
-        if (targetTps <= 0) {
-            return;
-        }
-
-        double currentTps = metrics.getCurrentThroughput();
-        long p90Latency = metrics.get90thPercentile();
-
-        double tpsDifference = targetTps - currentTps;
-        double tpsPercentageDiff = (tpsDifference / targetTps) * 100;
-
-        // Decision logic
-        int newThreadTarget = currentThreadTarget;
-
-        if (Math.abs(tpsPercentageDiff) > 5) { // Threshold: 5% deviation
-            if (tpsPercentageDiff > 0) {
-                // Current TPS is lower than target - increase threads
-                newThreadTarget = Math.min(
-                    (int) getMaxThreads(),
-                    currentThreadTarget + (int) getRampUpStep()
-                );
-            } else if (tpsPercentageDiff < -10 && p90Latency < getP90ThresholdMs()) {
-                // Current TPS is much higher than target and latency is good - can reduce threads
-                newThreadTarget = Math.max(
-                    (int) getMinThreads(),
-                    currentThreadTarget - (int) getRampDownStep()
-                );
+        CSV_LOCK.readLock().lock();
+        try {
+            if (csvEntries == null || csvEntries.isEmpty()) {
+                return;
             }
-        }
 
-        if (newThreadTarget != currentThreadTarget) {
-            System.out.println(String.format(
-                "[%dms] Adjustment: Current TPS=%.2f, Target=%d, P90=%.2fms, " +
-                "Threads: %d -> %d",
-                elapsedTime, currentTps, targetTps, (double) p90Latency,
-                currentThreadTarget, newThreadTarget
-            ));
-            currentThreadTarget = newThreadTarget;
-            updateThreadCount(newThreadTarget);
-        }
+            long elapsedTime = System.currentTimeMillis() - testStartTime;
+            int targetTps = CSVThroughputReader.getTargetTpsForTime(csvEntries, elapsedTime);
 
-        // Reset metrics for next window
-        metrics.reset();
+            if (targetTps <= 0) {
+                return;
+            }
+
+            double currentTps = metrics.getCurrentThroughput();
+            long p90Latency = metrics.get90thPercentile();
+
+            double tpsDifference = targetTps - currentTps;
+            double tpsPercentageDiff = (tpsDifference / targetTps) * 100;
+
+            // Decision logic
+            int newThreadTarget = currentThreadTarget;
+
+            if (Math.abs(tpsPercentageDiff) > 5) { // Threshold: 5% deviation
+                if (tpsPercentageDiff > 0) {
+                    // Current TPS is lower than target - increase threads
+                    newThreadTarget = Math.min(
+                        (int) getMaxThreads(),
+                        currentThreadTarget + (int) getRampUpStep()
+                    );
+                } else if (tpsPercentageDiff < -10 && p90Latency < getP90ThresholdMs()) {
+                    // Current TPS is much higher than target and latency is good - can reduce threads
+                    newThreadTarget = Math.max(
+                        (int) getMinThreads(),
+                        currentThreadTarget - (int) getRampDownStep()
+                    );
+                }
+            }
+
+            if (newThreadTarget != currentThreadTarget) {
+                System.out.println(String.format(
+                    "[%dms] Adjustment: Current TPS=%.2f, Target=%d, P90=%.2fms, " +
+                    "Threads: %d -> %d",
+                    elapsedTime, currentTps, targetTps, (double) p90Latency,
+                    currentThreadTarget, newThreadTarget
+                ));
+                currentThreadTarget = newThreadTarget;
+                updateThreadCount(newThreadTarget);
+            }
+
+            // Reset metrics for next window
+            metrics.reset();
+        } finally {
+            CSV_LOCK.readLock().unlock();
+        }
     }
 
     /**
@@ -353,6 +395,15 @@ public class AdaptiveTimerFromCSV extends AbstractTestElement implements Timer {
         return Boolean.parseBoolean(getPropertyAsString(INFINITE_EXECUTION, "false"));
     }
 
+    public void setEnableCsvReload(boolean enable) {
+        setProperty(new StringProperty(ENABLE_CSV_RELOAD, String.valueOf(enable)));
+        reloadEnabled = enable;
+    }
+
+    public boolean isEnableCsvReload() {
+        return Boolean.parseBoolean(getPropertyAsString(ENABLE_CSV_RELOAD, "true"));
+    }
+
     /**
      * Validate that CSV covers full 24-hour period (00:00 to 23:59) for infinite execution
      * @return validation result with error message if invalid
@@ -362,44 +413,49 @@ public class AdaptiveTimerFromCSV extends AbstractTestElement implements Timer {
             return new ValidationResult(true, null); // No validation needed for non-infinite mode
         }
 
-        if (csvEntries == null || csvEntries.isEmpty()) {
-            return new ValidationResult(false, "No CSV entries loaded. Cannot validate 24-hour coverage.");
-        }
+        CSV_LOCK.readLock().lock();
+        try {
+            if (csvEntries == null || csvEntries.isEmpty()) {
+                return new ValidationResult(false, "No CSV entries loaded. Cannot validate 24-hour coverage.");
+            }
 
-        // Find min and max times in entries
-        long minTimeMs = Long.MAX_VALUE;
-        long maxTimeMs = Long.MIN_VALUE;
-        
-        for (CSVThroughputEntry entry : csvEntries) {
-            long timeMs = entry.getTotalTimeMs();
-            minTimeMs = Math.min(minTimeMs, timeMs);
-            maxTimeMs = Math.max(maxTimeMs, timeMs);
-        }
+            // Find min and max times in entries
+            long minTimeMs = Long.MAX_VALUE;
+            long maxTimeMs = Long.MIN_VALUE;
+            
+            for (CSVThroughputEntry entry : csvEntries) {
+                long timeMs = entry.getTotalTimeMs();
+                minTimeMs = Math.min(minTimeMs, timeMs);
+                maxTimeMs = Math.max(maxTimeMs, timeMs);
+            }
 
-        // Check for 00:00 (0ms) and 23:59 (86340000ms = 1439 minutes)
-        long twentyThreeFiftyNineMs = 23 * 60 * 60 * 1000 + 59 * 60 * 1000; // 86340000ms
-        
-        StringBuilder errorMsg = new StringBuilder();
-        boolean isValid = true;
-        
-        if (minTimeMs > 0) {
-            isValid = false;
-            errorMsg.append("CSV missing entry for 00:00 (start of day). ");
-        }
-        
-        if (maxTimeMs < twentyThreeFiftyNineMs) {
-            isValid = false;
-            errorMsg.append("CSV missing entry for 23:59 (end of day). ");
-        }
+            // Check for 00:00 (0ms) and 23:59 (86340000ms = 1439 minutes)
+            long twentyThreeFiftyNineMs = 23 * 60 * 60 * 1000 + 59 * 60 * 1000; // 86340000ms
+            
+            StringBuilder errorMsg = new StringBuilder();
+            boolean isValid = true;
+            
+            if (minTimeMs > 0) {
+                isValid = false;
+                errorMsg.append("CSV missing entry for 00:00 (start of day). ");
+            }
+            
+            if (maxTimeMs < twentyThreeFiftyNineMs) {
+                isValid = false;
+                errorMsg.append("CSV missing entry for 23:59 (end of day). ");
+            }
 
-        if (!isValid) {
-            String foundRange = formatTimeFromMs(minTimeMs) + " to " + formatTimeFromMs(maxTimeMs);
-            errorMsg.append("Found: ").append(foundRange).append(" (incomplete 24-hour coverage). ");
-            errorMsg.append("Infinite execution requires full 24-hour coverage from 00:00 to 23:59.");
-            return new ValidationResult(false, errorMsg.toString());
-        }
+            if (!isValid) {
+                String foundRange = formatTimeFromMs(minTimeMs) + " to " + formatTimeFromMs(maxTimeMs);
+                errorMsg.append("Found: ").append(foundRange).append(" (incomplete 24-hour coverage). ");
+                errorMsg.append("Infinite execution requires full 24-hour coverage from 00:00 to 23:59.");
+                return new ValidationResult(false, errorMsg.toString());
+            }
 
-        return new ValidationResult(true, null);
+            return new ValidationResult(true, null);
+        } finally {
+            CSV_LOCK.readLock().unlock();
+        }
     }
 
     /**
@@ -410,6 +466,128 @@ public class AdaptiveTimerFromCSV extends AbstractTestElement implements Timer {
         long hours = totalSeconds / 3600;
         long minutes = (totalSeconds % 3600) / 60;
         return String.format("%02d:%02d", hours, minutes);
+    }
+
+    /**
+     * Start the CSV reload task that checks for file changes every minute
+     */
+    private void startCsvReloadTask() {
+        // Only create executor if not already created
+        if (csvReloadExecutor == null) {
+            csvReloadExecutor = Executors.newScheduledThreadPool(1, r -> {
+                Thread t = new Thread(r, "CSV-Reload-Task");
+                t.setDaemon(true);
+                return t;
+            });
+        }
+        
+        // Schedule the reload task to run every 60 seconds (1 minute)
+        if (csvReloadTask == null || csvReloadTask.isCancelled()) {
+            csvReloadTask = csvReloadExecutor.scheduleAtFixedRate(
+                this::reloadCsvIfModified,
+                60,  // Initial delay: 60 seconds
+                60,  // Repeat every 60 seconds
+                TimeUnit.SECONDS
+            );
+            System.out.println("CSV reload task started - checking for file modifications every 60 seconds");
+        }
+    }
+
+    /**
+     * Stop the CSV reload task
+     */
+    private void stopCsvReloadTask() {
+        if (csvReloadTask != null && !csvReloadTask.isCancelled()) {
+            csvReloadTask.cancel(false);
+            System.out.println("CSV reload task stopped");
+        }
+        
+        if (csvReloadExecutor != null && !csvReloadExecutor.isShutdown()) {
+            csvReloadExecutor.shutdown();
+            try {
+                if (!csvReloadExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    csvReloadExecutor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                csvReloadExecutor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+            csvReloadExecutor = null;
+        }
+    }
+
+    /**
+     * Check if the CSV file has been modified and reload it if necessary
+     */
+    private void reloadCsvIfModified() {
+        if (!reloadEnabled || currentCsvFilePath == null) {
+            return;
+        }
+
+        try {
+            java.io.File csvFile = new java.io.File(currentCsvFilePath);
+            if (!csvFile.exists()) {
+                System.err.println("CSV file no longer exists: " + currentCsvFilePath);
+                return;
+            }
+
+            long currentFileModifiedTime = csvFile.lastModified();
+            
+            if (currentFileModifiedTime > lastFileModifiedTime) {
+                System.out.println("CSV file modification detected. Reloading: " + currentCsvFilePath);
+                
+                try {
+                    List<CSVThroughputEntry> newEntries = CSVThroughputReader.readFile(currentCsvFilePath);
+                    
+                    if (newEntries.isEmpty()) {
+                        System.err.println("Reloaded CSV file is empty or contains no valid entries. Keeping previous data.");
+                        return;
+                    }
+
+                    // Validate 24-hour coverage if infinite execution is enabled
+                    if (isInfiniteExecution()) {
+                        // Temporarily update csvEntries for validation
+                        CSV_LOCK.writeLock().lock();
+                        try {
+                            csvEntries = newEntries;
+                            ValidationResult validation = validate24HourCoverage();
+                            
+                            if (!validation.isValid) {
+                                System.err.println("Reloaded CSV does not meet 24-hour coverage requirement: " + validation.errorMessage);
+                                // Reload the old entries
+                                csvEntries = CSVThroughputReader.readFile(currentCsvFilePath);
+                                return;
+                            }
+                        } finally {
+                            CSV_LOCK.writeLock().unlock();
+                        }
+                    } else {
+                        // Update with write lock
+                        CSV_LOCK.writeLock().lock();
+                        try {
+                            csvEntries = newEntries;
+                        } finally {
+                            CSV_LOCK.writeLock().unlock();
+                        }
+                    }
+
+                    // Update the file modification time
+                    lastFileModifiedTime = currentFileModifiedTime;
+                    
+                    CSV_LOCK.readLock().lock();
+                    try {
+                        System.out.println("CSV file reloaded successfully. New entries: " + csvEntries.size());
+                        System.out.println("Updated entries: " + csvEntries);
+                    } finally {
+                        CSV_LOCK.readLock().unlock();
+                    }
+                } catch (IOException e) {
+                    System.err.println("Error reloading CSV file: " + e.getMessage());
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("Error checking CSV file modification: " + e.getMessage());
+        }
     }
 
     /**

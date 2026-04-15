@@ -30,6 +30,7 @@ public class AdaptiveTimerFromCSVGui extends AbstractTimerGui {
     private JRadioButton stepBasedRadio;
     private JRadioButton timeBasedRadio;
     private JCheckBox infiniteExecutionCheckbox;
+    private JCheckBox enableCsvReloadCheckbox;
     private JPanel rampPanel;
     private JPanel timePanel;
     private JButton browseButton;
@@ -156,6 +157,14 @@ public class AdaptiveTimerFromCSVGui extends AbstractTimerGui {
         infinitePanel.add(infiniteExecutionCheckbox);
         panel.add(infinitePanel);
 
+        // Dynamic CSV Reload
+        JPanel csvReloadPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
+        enableCsvReloadCheckbox = new JCheckBox("Enable Dynamic CSV Reload (check every 60 seconds)");
+        enableCsvReloadCheckbox.setToolTipText("Enable to automatically reload CSV file every minute if it has been modified. Test can continue running without interruption.");
+        enableCsvReloadCheckbox.setSelected(true); // Default: enabled
+        csvReloadPanel.add(enableCsvReloadCheckbox);
+        panel.add(csvReloadPanel);
+
         // Initialize field states based on default selection
         updateFieldStates();
 
@@ -269,6 +278,9 @@ public class AdaptiveTimerFromCSVGui extends AbstractTimerGui {
             // Load infinite execution checkbox
             infiniteExecutionCheckbox.setSelected(timer.isInfiniteExecution());
             
+            // Load CSV reload checkbox
+            enableCsvReloadCheckbox.setSelected(timer.isEnableCsvReload());
+            
             // Update field states based on mode
             updateFieldStates();
             
@@ -339,6 +351,7 @@ public class AdaptiveTimerFromCSVGui extends AbstractTimerGui {
             timer.setEndTime(endTimeField.getText());
             timer.setDefaultStartTime(defaultStartTimeField.getText());
             timer.setInfiniteExecution(infiniteExecutionCheckbox.isSelected());
+            timer.setEnableCsvReload(enableCsvReloadCheckbox.isSelected());
             
             // Set mode based on selection
             if (defaultRadio.isSelected()) {
